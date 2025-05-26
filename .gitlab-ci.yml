@@ -1,0 +1,74 @@
+variables:
+  GIT_STRATEGY: clone
+  GIT_DEPTH: "2"
+  FF_TIMESTAMPS: 1
+  DOCKER_REGISTRY: "registry.gitlab.com/freedesktop-sdk/infrastructure/freedesktop-sdk-docker-images"
+  DOCKER_IMAGE_TAG: "latest"
+
+default:
+  image: "${DOCKER_REGISTRY}/bst2:${DOCKER_IMAGE_TAG}"
+  interruptible: true
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - scheduler_failure
+      - job_execution_timeout
+
+stages:
+  - lint
+  - schedule
+
+lint:
+  stage: lint
+  needs: []
+  timeout: 30 minutes
+  script:
+    - |
+      ostree init --repo=stable_repo
+      test -f summary/stable.summary && cp -vf summary/stable.summary stable_repo/summary
+      test -f stable_repo/summary && ostree --repo=stable_repo summary -v|grep "Collection ID (ostree.summary.collection-id): org.flathub.Stable"
+      ostree init --repo=beta_repo
+      test -f summary/beta.summary && cp -vf summary/beta.summary beta_repo/summary
+      test -f beta_repo/summary && ostree --repo=beta_repo summary -v|grep "Collection ID (ostree.summary.collection-id): org.flathub.Beta"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "schedule" && ($CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main")'
+
+update-summary:
+  stage: schedule
+  needs: []
+  timeout: 30 minutes
+  before_script:
+    - eval $(ssh-agent -s)
+    - mkdir -p ~/.ssh
+    - cp "$SSH_PRIVATE_KEY" ~/.ssh/id_rsa
+    - ssh-keyscan -H gitlab.com >> ~/.ssh/known_hosts
+    - chmod -R 600 ~/.ssh
+    - git config --global http.sslVerify false
+    - git config --global user.email "bbhtt.zn0i8@slmail.me"
+    - git config --global user.name "bbhtt"
+    - git remote rm origin
+    - git remote add origin git@$CI_SERVER_HOST:$CI_PROJECT_PATH.git
+    # - git lfs pull
+  script:
+    - mkdir -p summary
+    - curl -L -o summary/stable.summary http://dl.flathub.org/repo/summary
+    - curl -L -o summary/beta.summary http://dl.flathub.org/beta-repo/summary
+    - git add summary
+    - |
+      if ! git diff-index --quiet HEAD; then
+        LAST_MSG="$(git log -1 --pretty=%B)"
+        NEW_MSG="(Automated) Update summary files"
+        if [ "$LAST_MSG" = "$NEW_MSG" ]; then
+          git commit --amend --reset-author -m "$NEW_MSG"
+          git push --force origin HEAD:$CI_DEFAULT_BRANCH
+        else
+          git commit -m "$NEW_MSG"
+          git push origin HEAD:$CI_DEFAULT_BRANCH
+        fi
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_COMMIT_REF_PROTECTED == "true" && ($CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger")'
+      when: always
+    - when: never
